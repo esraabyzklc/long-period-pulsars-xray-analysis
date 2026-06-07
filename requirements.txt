@@ -1,0 +1,118 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# EPIC-pn spectral extraction, response generation, stacking, and grouping pipeline
+# for PSR J0250+5854.
+
+BASE_DIR="${BASE_DIR:-/path/to/PSR_J0250}"
+OBSIDS=(0844000201 0844000301 0844000401 0844000501 0844000701 0844000901 0844001101 0844001201)
+PN_CLEAN="pn_clean.fits"
+
+# Radio timing position of PSR J0250+5854 used in the thesis workflow.
+SRC_RA=42.7512
+SRC_DEC=58.9012
+
+for ID in "${OBSIDS[@]}"; do
+    echo "--- ${ID} ---"
+
+    if [[ ! -d "${BASE_DIR}/${ID}" ]]; then
+        echo "Missing directory: ${BASE_DIR}/${ID}; skipping."
+        continue
+    fi
+
+    cd "${BASE_DIR}/${ID}"
+
+    export SAS_ODF="$(ls *SUM.SAS 2>/dev/null | head -n 1 || true)"
+    export SAS_CCF="$(pwd)/ccf.cif"
+
+    if [[ ! -f image_clean.fits ]]; then
+        echo "image_clean.fits not found; skipping ${ID}."
+        continue
+    fi
+
+    if [[ ! -f "${PN_CLEAN}" ]]; then
+        echo "${PN_CLEAN} not found; skipping ${ID}."
+        continue
+    fi
+
+    ecoordconv imageset=image_clean.fits x="${SRC_RA}" y="${SRC_DEC}" coordtype=eqpos > coords_out.txt
+    SRC_X=$(grep 'X:' coords_out.txt | awk '{print $2}' | cut -d. -f1)
+    SRC_Y=$(grep 'Y:' coords_out.txt | awk '{print $4}' | cut -d. -f1)
+
+    if [[ -z "${SRC_X}" || -z "${SRC_Y}" ]]; then
+        echo "Source coordinates could not be converted; skipping ${ID}."
+        continue
+    fi
+
+    BKG_RA_VAL=$(echo "${SRC_RA} + 0.06" | bc)
+    ecoordconv imageset=image_clean.fits x="${BKG_RA_VAL}" y="${SRC_DEC}" coordtype=eqpos > coords_bkg_out.txt
+    BKG_X=$(grep 'X:' coords_bkg_out.txt | awk '{print $2}' | cut -d. -f1)
+    BKG_Y=$(grep 'Y:' coords_bkg_out.txt | awk '{print $4}' | cut -d. -f1)
+
+    if [[ -z "${BKG_X}" || -z "${BKG_Y}" ]]; then
+        echo "Background coordinates could not be converted; skipping ${ID}."
+        continue
+    fi
+
+    evselect table="${PN_CLEAN}" \
+        withspectrumset=yes \
+        spectrumset=pn_source_spec.fits \
+        energycolumn=PI spectralbinsize=5 \
+        withspecranges=yes specchannelmin=0 specchannelmax=20479 \
+        expression="(FLAG==0) && (PATTERN<=4) && ((X,Y) IN circle(${SRC_X},${SRC_Y},400))"
+
+    evselect table="${PN_CLEAN}" \
+        withspectrumset=yes \
+        spectrumset=pn_bkg_spec.fits \
+        energycolumn=PI spectralbinsize=5 \
+        withspecranges=yes specchannelmin=0 specchannelmax=20479 \
+        expression="(FLAG==0) && (PATTERN<=4) && ((X,Y) IN circle(${BKG_X},${BKG_Y},400))"
+
+    backscale spectrumset=pn_source_spec.fits badpixlocation="${PN_CLEAN}"
+    backscale spectrumset=pn_bkg_spec.fits badpixlocation="${PN_CLEAN}"
+    rmfgen spectrumset=pn_source_spec.fits rmfset=pn.rmf
+    arfgen spectrumset=pn_source_spec.fits arfset=pn.arf withrmfset=yes rmfset=pn.rmf \
+        badpixlocation="${PN_CLEAN}" detmaptype=psf
+done
+
+cd "${BASE_DIR}" || exit 1
+
+cmd_pha=()
+cmd_bkg=()
+cmd_rmf=()
+cmd_arf=()
+
+for ID in "${OBSIDS[@]}"; do
+    src="${BASE_DIR}/${ID}/pn_source_spec.fits"
+    bkg="${BASE_DIR}/${ID}/pn_bkg_spec.fits"
+    rmf="${BASE_DIR}/${ID}/pn.rmf"
+    arf="${BASE_DIR}/${ID}/pn.arf"
+
+    if [[ -f "${src}" && -f "${bkg}" && -f "${rmf}" && -f "${arf}" ]]; then
+        cmd_pha+=("${src}")
+        cmd_bkg+=("${bkg}")
+        cmd_rmf+=("${rmf}")
+        cmd_arf+=("${arf}")
+    fi
+done
+
+if [[ ${#cmd_pha[@]} -eq 0 ]]; then
+    echo "No valid spectra found for stacking."
+    exit 1
+fi
+
+epicspeccombine \
+    pha="${cmd_pha[*]}" \
+    bkg="${cmd_bkg[*]}" \
+    rmf="${cmd_rmf[*]}" \
+    arf="${cmd_arf[*]}" \
+    filepha=J0250_FINAL_SPEC.fits \
+    filebkg=J0250_FINAL_BKG.fits \
+    filersp=J0250_FINAL.rsp
+
+grppha \
+    infile=J0250_FINAL_SPEC.fits \
+    outfile=J0250_FINAL_GRP.fits \
+    comm="group min 25 & chkey BACKFILE J0250_FINAL_BKG.fits & chkey RESPFILE J0250_FINAL.rsp & exit"
+
+echo "Complete: J0250_FINAL_GRP.fits"

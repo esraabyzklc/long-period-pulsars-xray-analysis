@@ -1,34 +1,81 @@
-# Long-Period Pulsars: X-ray Data Analysis
+#!/usr/bin/env bash
+set -euo pipefail
 
-This repository contains the analysis scripts developed for my undergraduate graduation thesis on long-period pulsars and isolated neutron stars.
+# Image creation, exposure-map generation, and ML source detection with edetect_chain
+# for PSR J0250+5854.
 
-The project focuses on scientific X-ray data analysis, including data reduction, spectral preparation, spectral modelling, upper-limit estimation, and visualization of results.
+BASE_DIR="${BASE_DIR:-/path/to/PSR_J0250}"
+OBSIDS=(0844000201 0844000301 0844000401 0844000501 0844000701 0844000901 0844001101 0844001201)
+PN_CLEAN="pn_clean.fits"
 
-## Thesis Context
+for ID in "${OBSIDS[@]}"; do
+    echo "Processing Observation ID: ${ID}"
 
-My graduation thesis investigates long-period pulsars, a group of neutron stars with unusually long spin periods. The analysis part focuses on observational X-ray constraints and the interpretation of spectral properties in relation to neutron star emission mechanisms.
+    if [[ -d "${BASE_DIR}/${ID}" ]]; then
+        cd "${BASE_DIR}/${ID}"
+    else
+        echo "Error: Directory for ${ID} not found. Skipping."
+        continue
+    fi
 
-## Methods
+    export SAS_ODF="$(pwd)"
+    if [[ ! -f ccf.cif ]]; then
+        cifbuild fullpath=yes
+    fi
+    export SAS_CCF="$(pwd)/ccf.cif"
 
-The workflow includes:
+    sum_file=$(ls *SUM.SAS 2>/dev/null | head -n 1 || true)
+    if [[ -z "${sum_file}" ]]; then
+        odfingest odfdir="$(pwd)" outdir="$(pwd)"
+        sum_file=$(ls *SUM.SAS | head -n 1)
+    fi
+    export SAS_ODF="${sum_file}"
 
-- Processing archival X-ray observations
-- Preparing cleaned data products
-- Extracting source and background spectra
-- Generating response files
-- Performing spectral modelling
-- Estimating flux upper limits
-- Visualizing spectral results
+    attfile=$(ls *ATTTSR*.FIT 2>/dev/null | head -n 1 || true)
+    if [[ -z "${attfile}" ]]; then
+        echo "Error: Attitude file missing for ${ID}. Skipping."
+        continue
+    fi
 
-## Tools
+    if [[ ! -f "${PN_CLEAN}" ]]; then
+        echo "Error: ${PN_CLEAN} not found for ${ID}. Run the event-cleaning step first."
+        continue
+    fi
 
-- Python
-- Bash scripting
-- XMM-Newton SAS
-- XSPEC / HEASoft
-- Matplotlib
-- NumPy
+    evselect table="${PN_CLEAN}" \
+        imagebinning=binSize \
+        imageset=image_clean.fits \
+        withimageset=yes \
+        xcolumn=X ycolumn=Y \
+        ximagebinsize=80 yimagebinsize=80 \
+        ximagesize=600 yimagesize=600 \
+        expression='(PI>200) && (PI<12000) && (FLAG==0) && (PATTERN<=4)'
 
-## Note on Data
+    eexpmap \
+        imageset=image_clean.fits \
+        attitudeset="${attfile}" \
+        eventset="${PN_CLEAN}" \
+        expimageset=exposure_map.fits \
+        pimin=200 pimax=12000
 
-Raw observational data are not included in this repository due to file size limitations. They can be obtained from public X-ray astronomy archives using the relevant observation IDs.
+    edetect_chain \
+        imagesets=image_clean.fits \
+        eventsets="${PN_CLEAN}" \
+        attitudeset="${attfile}" \
+        expimagesets=exposure_map.fits \
+        pimin=200 pimax=12000 \
+        likemin=8 \
+        eml_list=emllist.fits \
+        box_list=boxlist.fits \
+        bkgimagesets=bkg_map.fits
+
+    srcdisplay \
+        boxlistset=emllist.fits \
+        imageset=image_clean.fits \
+        regionfile=region.reg \
+        sourceradius=0.01 \
+        withregionfile=yes \
+        withimgdisplay=no
+
+    echo "Observation ID ${ID} processing complete."
+done
